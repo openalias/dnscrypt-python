@@ -1,0 +1,11 @@
+*.pyc
+*.swp
+build/
+dist/
+*.egg/
+locale/
+.devlocaltmp/
+*_trial_temp
+packages
+env/
+
