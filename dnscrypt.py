@@ -281,7 +281,7 @@ def decode_message(answer, nonce, nmkey):
         raise DnscryptException("Message decoding error.")
 
 
-def query(url, ip, port, provider_key, provider_url, record_type=1):
+def query(url, ip, port, provider_key, provider_url, record_type=1, return_packet=True):
     # get public key from provider
     try:
         provider_pk = get_public_key(ip, port, provider_key, provider_url)[:32]
@@ -306,9 +306,16 @@ def query(url, ip, port, provider_key, provider_url, record_type=1):
     # create nmkey out of provider's public key and local secret key
     nmkey = create_nmkey(provider_pk, sk)
 
-    message = packet.toBinary() + '\x00\x00\x29\x04\xe4' + 6 * '\x00' + '\x80' + 404 * '\x00'
+    message = packet.toBinary() + '\x00\x00\x29\x04\xe4' + 6 * '\x00' + '\x80'
 
-    nonce = "%x" % int(time.time()) + os.urandom(4)
+    # custom rules for type 48
+    if record_type == 48:
+        url_part = ''
+        for part in question.labels:
+            url_part += chr(len(part)) + part
+        message = '\x124\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01' + url_part + '\x00\x000\x00\x01\x00\x00)\x05\x00\x00\x00\x80\x00\x00\x00\x80'
+
+    nonce = "%x" % int(time.time()) + os.urandom(4).encode('hex')[4:]
 
     encoded_message = encode_message(message, nonce, nmkey)
 
@@ -319,7 +326,7 @@ def query(url, ip, port, provider_key, provider_url, record_type=1):
     dest = (ip, port)
 
     sock.sendto(magic_query + pk + nonce + encoded_message, dest)
-    (response, address) = sock.recvfrom(1024)
+    (response, address) = sock.recvfrom(2048)
 
     resp_magic_query = response[:8]
     resp_client_nonce = response[8:20]
@@ -332,6 +339,10 @@ def query(url, ip, port, provider_key, provider_url, record_type=1):
         raise DnscryptException("Invalid nonce received.")
 
     decoded_answer = decode_message(resp_answer, resp_client_nonce + resp_server_nonce, nmkey)
+
+    # returns answer not converted to packet
+    if not return_packet:
+        return decoded_answer
 
     conv = DnsPacketConverter()
     packet = conv.fromBinary(decoded_answer)
