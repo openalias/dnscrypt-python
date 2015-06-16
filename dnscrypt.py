@@ -1,21 +1,21 @@
 # Copyright (c) 2014-2015, The Monero Project
-# 
+#
 # All rights reserved.
-# 
+#
 # Redistribution and use in source and binary forms, with or without modification, are
 # permitted provided that the following conditions are met:
-# 
+#
 # 1. Redistributions of source code must retain the above copyright notice, this list of
 #    conditions and the following disclaimer.
-# 
+#
 # 2. Redistributions in binary form must reproduce the above copyright notice, this list
 #    of conditions and the following disclaimer in the documentation and/or other
 #    materials provided with the distribution.
-# 
+#
 # 3. Neither the name of the copyright holder nor the names of its contributors may be
 #    used to endorse or promote products derived from this software without specific
 #    prior written permission.
-# 
+#
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
 # EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
 # MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
@@ -32,6 +32,7 @@ import StringIO
 import time
 import datetime
 import os
+import re
 from slownacl import poly1305, xsalsa20poly1305
 
 USE_LOCAL_LIBS = 1
@@ -183,6 +184,27 @@ class DnsPacketConverter:
         return labels
 
 
+class Certificate:
+    def __init__(self, bincert):
+        self.bincert = bincert
+        self.magic_query = bincert[96:104]
+        self.serial = int(bincert.encode('hex')[208:216], 16)
+        self.cert_start = datetime.datetime.fromtimestamp(int(bincert.encode('hex')[216:224], 16))
+        self.cert_end = datetime.datetime.fromtimestamp(int(bincert.encode('hex')[224:], 16))
+
+    def expired(self):
+        now = datetime.datetime.now()
+        if now < self.cert_start or now > self.cert_end:
+            return True
+        return False
+
+
+def find_certificates(resp):
+    '''Find certificates in the response.'''
+    return [resp[m.end():m.end() + 116]
+            for m in re.finditer('DNSC\x00\x01\x00\x00', resp)]
+
+
 def get_public_key(ip, port, provider_key, provider_url):
     '''Get public key from provider.'''
     header = DnsHeader()
@@ -201,31 +223,37 @@ def get_public_key(ip, port, provider_key, provider_url):
 
     (response, address) = sock.recvfrom(1024)
 
-    bincert = response.encode('hex')[-232:]
+    bincerts = find_certificates(response)
 
-    cert_start = datetime.datetime.fromtimestamp(int(bincert[216:224], 16))
-    cert_end = datetime.datetime.fromtimestamp(int(bincert[224:], 16))
-    now = datetime.datetime.now()
+    if not bincerts:
+        raise DnscryptException("No certificate received.")
 
-    if now < cert_start or now > cert_end:
+    certificates = []
+
+    for bincert in bincerts:
+        certificates.append(Certificate(bincert))
+
+    certificate = max(certificates, key=lambda x: x.serial and not x.expired())
+
+    if certificate.expired():
         raise DnscryptException("Certificate expired.")
 
     if USE_LOCAL_LIBS:
         try:
             import pysodium
-            return pysodium.crypto_sign_open(bincert.decode('hex'), provider_key.decode('hex'))
+            return pysodium.crypto_sign_open(certificate.bincert, provider_key.decode('hex')), certificate.magic_query
         except ImportError:
             pass
 
         try:
             import nacl
             import nacl.bindings
-            return nacl.bindings.crypto_sign_open(bincert.decode('hex'), provider_key.decode('hex'))
+            return nacl.bindings.crypto_sign_open(certificate.bincert, provider_key.decode('hex')), certificate.magic_query
         except ImportError:
             pass
 
     import ed25519py
-    return ed25519py.crypto_sign_open(bincert.decode('hex'), provider_key.decode('hex'))
+    return ed25519py.crypto_sign_open(certificate.bincert, provider_key.decode('hex')), certificate.magic_query
 
 
 def generate_keypair():
@@ -284,11 +312,9 @@ def decode_message(answer, nonce, nmkey):
 def query(url, ip, port, provider_key, provider_url, record_type=1, return_packet=True):
     # get public key from provider
     try:
-        provider_pk = get_public_key(ip, port, provider_key, provider_url)[:32]
+        provider_pk, magic_query = get_public_key(ip, port, provider_key, provider_url)
     except DnscryptException:
         raise DnscryptException("Certificate expired.")
-
-    magic_query = '7PYqwfzt'
 
     # create dns query
     header = DnsHeader()
@@ -304,7 +330,7 @@ def query(url, ip, port, provider_key, provider_url, record_type=1, return_packe
     (pk, sk) = generate_keypair()
 
     # create nmkey out of provider's public key and local secret key
-    nmkey = create_nmkey(provider_pk, sk)
+    nmkey = create_nmkey(provider_pk[:32], sk)
 
     message = packet.toBinary() + '\x00\x00\x29\x04\xe4' + 6 * '\x00' + '\x80'
 
@@ -319,7 +345,7 @@ def query(url, ip, port, provider_key, provider_url, record_type=1, return_packe
 
     encoded_message = encode_message(message, nonce, nmkey)
 
-    #poly = poly1305.onetimeauth_poly1305(encoded_message, provider_pk)  not quite sure if that's needed for something...
+    #poly = poly1305.onetimeauth_poly1305(encoded_message, provider_pk[:32])  not quite sure if that's needed for something...
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
